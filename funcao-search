@@ -1,0 +1,115 @@
+function search( $args = [], &$items_count = 0 ) {
+		if( ! is_array( $args ) ) $args = [ 'needle' => $args ];
+		if( ! wpfval( $args, 'needle' ) && ! wpfval( $args, 'postids' ) ) return [];
+
+		$args = array_filter( $args );
+
+		$default = [
+			'needle'      => '',                 // search needle
+			'forumids'    => [],         // array( 2, 10, 25 )
+			'postids'     => [],         // array( 2, 10, 25 )
+			'date_period' => 0,                 // topic id in DB
+			'type'        => 'entire-posts',     // search type ( entire-posts | titles-only | user-posts | user-topics | tag )
+			'orderby'     => 'relevancy',      // Sort Search Results by ( relevancy | date | user | forum )
+			'order'       => 'DESC',             // Sort Search Results ( ASC | DESC )
+			'offset'      => null,             // this use when you give row_count
+			'row_count'   => null             // 4 or 1 ...
+		];
+
+		$args            = wpforo_parse_args( $args, $default );
+		$args['postids'] = wpforo_parse_args( $args['postids'] );
+		$args['postids'] = array_filter( array_map( 'wpforo_bigintval', $args['postids'] ) );
+
+		$args['order'] = strtoupper( (string) $args['order'] );
+		if( ! in_array( $args['order'], [ 'ASC', 'DESC' ] ) ) $args['order'] = 'DESC';
+
+		$date_period = intval( $args['date_period'] );
+
+		$fa         = "p";
+		$from       = "`" . WPF()->tables->posts . "` " . $fa;
+		$selects    = [ $fa . '.`postid`', $fa . '.`topicid`', $fa . '.`private`', $fa . '.`status`', $fa . '.`forumid`', $fa . '.`userid`', $fa . '.`title`', $fa . '.`created`', $fa . '.`body`', $fa . '.`is_first_post`' ];
+		$innerjoins = [];
+		$wheres     = [];
+		$orders     = [];
+
+		if( $args['forumids'] ) $wheres[] = $fa . ".`forumid` IN(" . implode( ', ', array_map( 'intval', $args['forumids'] ) ) . ")";
+		if( $date_period != 0 ) {
+			$date = date( 'Y-m-d H:i:s', current_time( 'timestamp', 1 ) - ( $date_period * 24 * 60 * 60 ) );
+			if( $date ) $wheres[] = $fa . ".`created` > '" . esc_sql( $date ) . "'";
+		}
+
+		if( $args['needle'] ) {
+			if( in_array( $args['type'], [ 'entire-posts', 'titles-only' ] ) ) {
+				$words  = preg_split( '#[^\p{L}\p{N}\'`]+#u', $args['needle'] );
+				$words  = array_slice( array_filter( $words ), 0, 10 );
+				$words  = array_map( function( $w ) {
+					return '+' . esc_sql( str_replace( [ '(', ')', '*', '+', '-', '~', '<', '>', '@', '"' ], '', $w ) ) . '*';
+				}, $words );
+				$needle = implode( ' ', $words );
+			} else {
+				$needle = esc_sql( $args['needle'] );
+			}
+
+			if( $args['type'] === 'entire-posts' ) {
+				$selects[] = "MATCH(" . $fa . ".`title`) AGAINST('$needle' IN BOOLEAN MODE) + MATCH(" . $fa . ".`body`) AGAINST('$needle' IN BOOLEAN MODE) AS matches";
+				$wheres[]  = "( MATCH(" . $fa . ".`title`, " . $fa . ".`body`) AGAINST('$needle' IN BOOLEAN MODE) OR " . $fa . ".`title` LIKE '%" . esc_sql( $args['needle'] ) . "%' OR " . $fa . ".`body` LIKE '%" . esc_sql( $args['needle'] ) . "%' )";
+				$orders[]  = "matches";
+				$orders[]  = "`created`";
+			} elseif( $args['type'] === 'titles-only' ) {
+				$selects[] = "MATCH(" . $fa . ".`title`) AGAINST('$needle' IN BOOLEAN MODE) AS matches";
+				$wheres[]  = "( MATCH(" . $fa . ".`title`) AGAINST('$needle' IN BOOLEAN MODE) OR " . $fa . ".`title` LIKE '%" . esc_sql( $args['needle'] ) . "%' )";
+				$orders[]  = "matches";
+				$orders[]  = "`created`";
+			} elseif( $args['type'] === 'user-posts' || $args['type'] === 'user-topics' ) {
+				$innerjoins[] = "INNER JOIN `" . WPF()->db->users . "` u ON u.`ID` = " . $fa . ".`userid`";
+				$wheres[]     = "( u.`user_nicename` LIKE '%{$needle}%' OR u.`display_name` LIKE '%{$needle}%' )";
+				if( $args['type'] === 'user-topics' ) $wheres[] = "" . $fa . ".`is_first_post` = 1";
+			} elseif( $args['type'] === 'tag' ) {
+				$fa         = "t";
+				$from       = "`" . WPF()->tables->topics . "` " . $fa;
+				$selects    = [ $fa . '.`first_postid` AS postid', $fa . '.`topicid`', $fa . '.`private`', $fa . '.`status`', $fa . '.`forumid`', $fa . '.`userid`', $fa . '.`title`', $fa . '.`created`', '1 AS `is_first_post`' ];
+				$innerjoins = [];
+				$wheres     = [ "( " . $fa . ".`tags` LIKE '%{$needle}%' )" ];
+				//              $wheres = array( "( FIND_IN_SET('{$needle}', ".$fa.".`tags`) )" ); //exact version
+			}
+		}
+
+		if( $args['postids'] ) $wheres[] = "(" . $fa . ".`postid` IN(" . implode( ',', $args['postids'] ) . "))";
+
+		if( $args['orderby'] === 'date' ) {
+			$orders = [ $fa . '.`created`' ];
+		} elseif( $args['orderby'] === 'user' ) {
+			$orders = [ $fa . '.`userid`' ];
+		} elseif( $args['orderby'] === 'forum' ) {
+			$orders = [ $fa . '.`forumid`' ];
+		}
+
+		$sql = "SELECT COUNT(*) FROM " . $from . " " . implode( ' ', $innerjoins );
+		if( $wheres ) $sql .= " WHERE " . implode( " AND ", $wheres );
+		$items_count = (int) WPF()->db->get_var( $sql );
+		if( wpforo_setting( 'topics', 'search_max_results' ) && $items_count > wpforo_setting( 'topics', 'search_max_results' ) ) $items_count = wpforo_setting( 'topics', 'search_max_results' );
+
+		$sql = "SELECT " . implode( ', ', $selects ) . " FROM " . $from . " " . implode( ' ', $innerjoins );
+		if( $wheres ) $sql .= " WHERE " . implode( " AND ", $wheres );
+		if( $orders ) $sql .= " ORDER BY " . implode( ' ' . $args['order'] . ', ', $orders ) . " " . $args['order'];
+
+		if( wpforo_setting( 'topics', 'search_max_results' ) ) $sql = "SELECT * FROM (" . $sql . " LIMIT " . wpforo_setting( 'topics', 'search_max_results' ) . ") AS p";
+
+		if( $args['row_count'] ) $sql .= " LIMIT " . intval( $args['offset'] ) . "," . intval( $args['row_count'] );
+
+		$sql = apply_filters( 'wpforo_search_sql', $sql, $args );
+
+		$posts = WPF()->db->get_results( $sql, ARRAY_A );
+
+		do_action( 'wpforo_search_result_after', $args, $items_count, $posts, $sql );
+
+		foreach( $posts as $key => $post ) {
+			if( ! WPF()->perm->forum_can( 'vf', $post['forumid'] ) ) unset( $posts[ $key ] );
+			if( ! WPF()->perm->forum_can( 'vt', $post['forumid'] ) ) unset( $posts[ $key ] );
+			if( ! $post['is_first_post'] && ! WPF()->perm->forum_can( 'vr', $post['forumid'] ) ) unset( $posts[ $key ] );
+			if( $post['private'] && ! WPF()->perm->forum_can( 'vp', $post['forumid'] ) ) unset( $posts[ $key ] );
+			if( $post['status'] && ! WPF()->perm->forum_can( 'au', $post['forumid'] ) ) unset( $posts[ $key ] );
+		}
+
+		return $posts;
+	}
